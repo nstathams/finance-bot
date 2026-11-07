@@ -1,0 +1,7 @@
+aiogram
+aiosqlite
+python-dotenv
+matplotlib
+pandas
+aiogram-calendar
+python-dateutil
