@@ -26,7 +26,7 @@
 1. **Клонируй репозиторий:**
 
    ```bash
-   git clone https://github.com/username/finance-bot.git
+   git clone https://github.com/nstathams/finance-bot.git
    cd finance-bot
    ```
 
