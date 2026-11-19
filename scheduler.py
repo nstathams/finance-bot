@@ -1,13 +1,16 @@
 import asyncio
+import logging
 from datetime import datetime
-
+from html import escape
+from utils.errors import DatabaseError
 from aiogram import Bot
 
 from database.db_manager import (
-    add_transaction,
     get_due_recurring_payments,
-    advance_recurring_payment,
+    process_recurring_payment,
 )
+
+log = logging.getLogger(__name__)
 
 
 async def run_recurring_scheduler(bot: Bot):
@@ -17,33 +20,32 @@ async def run_recurring_scheduler(bot: Bot):
             due = await get_due_recurring_payments(today)
 
             for p in due:
+                try:
+                    warning = await process_recurring_payment(p)
+                except DatabaseError:
+                    log.exception("Не удалось обработать платёж id=%s", p["id"])
+                    continue
+
                 if p["action"] == "auto":
-                    success, warning = await add_transaction(
-                        p["user_id"], p["amount"], p["category"], p["type"]
+                    sign = "-" if p["type"] == "expense" else "+"
+                    text = (
+                        f"🤖 <b>Автоплатёж выполнен:</b> {sign}{p['amount']:.2f} ₽ — "
+                        f"{escape(p['category'])}"
                     )
-                    if success:
-                        sign = "-" if p["type"] == "expense" else "+"
-                        text = (
-                            f"🤖 **Автоплатёж выполнен:** {sign}{p['amount']:.2f} ₽ — {p['category']}"
-                        )
-                        if warning:
-                            text += "\n\n" + warning
-                    else:
-                        text = "⚠️ Не удалось выполнить автоплатёж."
+                    if warning:
+                        text += "\n\n" + warning
                 else:
                     text = (
-                        f"🔔 **Напоминание о платеже:** {p['category']} — {p['amount']:.2f} ₽.\n"
-                        "Добавь операцию вручную или настрой автосписание."
+                        f"🔔 <b>Напоминание о платеже:</b> {escape(p['category'])} — "
+                        f"{p['amount']:.2f} ₽.\nДобавь операцию вручную или настрой автосписание."
                     )
 
                 try:
-                    await bot.send_message(p["user_id"], text, parse_mode="Markdown")
-                except Exception as e:
-                    print(f"Can't send recurring message to {p['user_id']}: {e}")
+                    await bot.send_message(p["user_id"], text)
+                except Exception:
+                    log.exception("Не удалось отправить сообщение пользователю %s", p["user_id"])
 
-                await advance_recurring_payment(p["id"], p["freq"])
-
-        except Exception as e:
-            print(f"Scheduler error: {e}")
+        except Exception:
+            log.exception("Ошибка планировщика")
 
         await asyncio.sleep(60)

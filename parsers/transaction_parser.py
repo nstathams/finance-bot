@@ -1,29 +1,31 @@
 import re
+from dataclasses import dataclass
+
+from utils.errors import InvalidFormatError
+
+OPERATION_RE = re.compile(
+    r"^\s*(?P<sign>[+-])\s*(?P<amount>\d+(?:[.,]\d{1,2})?)\s+(?P<category>\S.{0,49}?)\s*$"
+)
 
 
-def parse_transaction(text: str):
-    match = re.match(r'^([+-]?\d+(?:\.\d+)?)\s+(.+)', text.strip())
+@dataclass
+class Transaction:
+    amount: float
+    t_type: str
+    category: str
+
+
+def parse_transaction(text: str) -> Transaction:
+    match = OPERATION_RE.match(text or "")
     if not match:
-        return None, "Неверный формат ввода. Пример: -500 кофе или +10000 зарплата."
+        raise InvalidFormatError(
+            "Не понял операцию. Формат: -500 кофе или +50000 зарплата"
+        )
 
-    raw_amount = match.group(1)
-    category = match.group(2).strip()
+    amount = float(match["amount"].replace(",", "."))
+    if amount == 0:
+        raise InvalidFormatError("Сумма не может быть нулём")
 
-    category = category.lower()
-
-    try:
-        amount = float(raw_amount)
-    except ValueError:
-        return None, "Ошибка: сумма должна быть числом."
-
-    if amount < 0:
-        t_type = "expense"
-        amount = abs(amount)
-    else:
-        t_type = "income"
-
-    return {
-        "amount": amount,
-        "category": category,
-        "type": t_type
-    }, None
+    t_type = "expense" if match["sign"] == "-" else "income"
+    category = match["category"].strip().lower()
+    return Transaction(amount=amount, t_type=t_type, category=category)

@@ -1,11 +1,10 @@
 class FinanceError(Exception):
-    """Базовый класс для ошибок финансов."""
-    pass
+    """Базовая ошибка приложения."""
+
 
 class InvalidFormatError(FinanceError):
-    """Ошибка формата ввода пользователя."""
-    pass
+    """Неверный формат ввода пользователем."""
+
 
 class DatabaseError(FinanceError):
     """Ошибка работы с базой данных."""
-    pass

@@ -1,435 +1,517 @@
+import logging
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+
 import aiosqlite
-from datetime import datetime, timedelta, date
-from typing import List, Dict, Any, Optional
 from dateutil.relativedelta import relativedelta
 
-DB_NAME = "finance.db"
+from utils.errors import DatabaseError
 
-def get_day_start_end(date: datetime) -> tuple[datetime, datetime]:
+DB_NAME = "finance.db"
+logger = logging.getLogger(__name__)
+
+FREQ_STEPS = {
+    "daily": lambda d: d + timedelta(days=1),
+    "weekly": lambda d: d + timedelta(weeks=1),
+    "monthly": lambda d: d + relativedelta(months=1),
+}
+
+
+def get_day_start_end(date: datetime):
     start = date.replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1) - timedelta(microseconds=1)
     return start, end
 
 
-def get_month_start_end(date: datetime) -> tuple[datetime, datetime]:
+def get_month_start_end(date: datetime):
     start = date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     end = start + relativedelta(months=1) - timedelta(microseconds=1)
-
     return start, end
 
 
+def _day(value) -> str:
+    if isinstance(value, str):
+        return value.strip()[:10]
+    return value.strftime("%Y-%m-%d")
+
+
+def _format_date(raw: str) -> str:
+    try:
+        return datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y")
+    except (ValueError, TypeError):
+        return (raw or "")[:10]
+
+
+def _period_start(reset_date: Optional[str], now: datetime) -> datetime:
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if not reset_date:
+        return month_start
+    try:
+        reset_dt = datetime.strptime(reset_date[:10], "%Y-%m-%d")
+    except ValueError:
+        return month_start
+    return max(month_start, reset_dt)
+
 async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        # 0. Таблица регулярных платежей (НОВАЯ)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS recurring_payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                amount REAL,
-                category TEXT,
-                type TEXT,
-                freq TEXT,
-                action TEXT,
-                next_run TEXT
-            )
-        """)
-    async with aiosqlite.connect(DB_NAME) as db:
-        # 1. Таблица users
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                balance REAL DEFAULT 0.0
-            )
-        """)
-
-        # 2. Таблица transactions
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                amount REAL,
-                category TEXT,
-                type TEXT,
-                date TEXT
-            )
-        """)
-
-        # 3. Таблица category_limits
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS category_limits (
-                user_id INTEGER,
-                category TEXT,
-                limit_amount REAL,
-                reset_date TEXT,
-                PRIMARY KEY (user_id, category)
-            )
-        """)
-
-        # 4. Миграция: добавляем reset_date, если её нет
-        try:
-            await db.execute("ALTER TABLE category_limits ADD COLUMN reset_date TEXT")
-        except aiosqlite.OperationalError as e:
-            if "duplicate column name" not in str(e):
-                raise e
-
-        # 5. Инициализируем reset_date для старых записей
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        await db.execute(
-            "UPDATE category_limits SET reset_date = ? WHERE reset_date IS NULL",
-            (today_str,)
-        )
-
-        await db.commit()
-
-
-async def export_transactions_to_csv_rows(user_id: int) -> List[List[str]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute(
-            """
-            SELECT date, category, type, amount 
-            FROM transactions 
-            WHERE user_id = ? 
-            ORDER BY date DESC
-            """,
-            (user_id,)
-        )
-        rows = await cursor.fetchall()
-
-    csv_data = [["Дата", "Категория", "Тип операции", "Сумма (₽)"]]
-
-    for row in rows:
-        raw_date, category, t_type, amount = row
-
-        try:
-            parsed_dt = datetime.strptime(raw_date, "%Y-%m-%d %H:%M:%S")
-            nice_date = parsed_dt.strftime("%d.%m.%Y")
-        except ValueError:
-            nice_date = raw_date
-
-        nice_type = "Пополнение" if t_type == "income" else "Трата"
-        nice_amount = f"{amount:,.2f}".replace(",", " ").replace(".", ",") + " ₽"
-
-        csv_data.append([nice_date, category.capitalize(), nice_type, nice_amount])
-
-    return csv_data
-
-
-
-async def get_period_stats(user_id: int, start_date: datetime | date, end_date: datetime | date) -> Dict[str, Any]:
-    # 1. Нормализация дат
-    if isinstance(start_date, date) and not isinstance(start_date, datetime):
-        start_date = datetime.combine(start_date, datetime.min.time())
-    if isinstance(end_date, date) and not isinstance(end_date, datetime):
-        end_date = datetime.combine(end_date, datetime.max.time())
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-
-        start_str = start_date.strftime("%Y-%m-%d %H:%M:%S")
-        end_str = end_date.strftime("%Y-%m-%d %H:%M:%S")
-
-        # 3. Используем эти строки в запросе
-        cursor = await db.execute(
-            """
-            SELECT
-                COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS total_expense,
-                COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) AS total_income
-            FROM transactions
-            WHERE user_id = ? AND date BETWEEN ? AND ?
-            """,
-            (user_id, start_str, end_str)
-        )
-        row = await cursor.fetchone()
-        total_expense = float(row["total_expense"] or 0.0)
-        total_income = float(row["total_income"] or 0.0)
-
-        # Детализация по категориям (только расходы)
-        cursor = await db.execute(
-            """
-            SELECT category, SUM(amount) AS amount
-            FROM transactions
-            WHERE user_id = ? AND type = 'expense' AND date BETWEEN ? AND ?
-            GROUP BY category
-            ORDER BY amount DESC
-            """,
-            (user_id, start_date.isoformat(), end_date.isoformat())
-        )
-        categories = [
-            {"category": r["category"], "amount": float(r["amount"] or 0.0)}
-            for r in await cursor.fetchall()
-        ]
-
-    return {
-        "total_expense": total_expense,
-        "total_income": total_income,
-        "categories": categories,
-    }
-
-
-async def add_transaction(user_id: int, amount: float, category: str, t_type: str):
-    category_lower = category.lower()
-    today = datetime.now()
-    current_month_str = today.strftime("%Y-%m")
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        try:
-            # 1. Вставляем транзакцию
-            await db.execute(
-                "INSERT INTO transactions (user_id, amount, category, type, date) VALUES (?, ?, ?, ?, ?)",
-                (user_id, amount, category_lower, t_type, today.strftime("%Y-%m-%d %H:%M:%S"))
-            )
-
-            # 2. Обновляем баланс
-            await db.execute(
-                "INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)",
-                (user_id,)
-            )
-            sign = 1 if t_type == 'income' else -1
-            await db.execute(
-                "UPDATE users SET balance = balance + ? WHERE user_id = ?",
-                (amount * sign, user_id)
-            )
-
-            warning = None
-
-            # 3. Проверка лимита
-            if t_type == 'expense':
-                cursor_limit = await db.execute(
-                    "SELECT limit_amount, reset_date FROM category_limits WHERE user_id = ? AND category = ?",
-                    (user_id, category_lower)
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    balance_kop INTEGER DEFAULT 0
                 )
-                row_limit = await cursor_limit.fetchone()
-
-                if row_limit:
-                    limit_value = row_limit[0]
-                    reset_date_str = row_limit[1] or today.strftime("%Y-%m-%d")
-                    reset_month_str = reset_date_str[:7]
-
-                    # Если месяц сменился, обновляем дату сброса
-                    if current_month_str > reset_month_str:
-                        await db.execute(
-                            "UPDATE category_limits SET reset_date = ? WHERE user_id = ? AND category = ?",
-                            (today.strftime("%Y-%m-%d"), user_id, category_lower)
-                        )
-
-                    # Сумма трат за текущий месяц
-                    cursor_sum = await db.execute(
-                        """
-                        SELECT COALESCE(SUM(amount), 0) FROM transactions
-                        WHERE user_id = ?
-                          AND category = ?
-                          AND type = 'expense'
-                          AND date >= ?
-                        """,
-                        (user_id, category_lower, current_month_str + "-01 00:00:00")
-                    )
-                    total_spent_row = await cursor_sum.fetchone()
-                    total_spent = float(total_spent_row[0])
-
-                    if total_spent > limit_value:
-                        excess = total_spent - limit_value
-                        warning = (
-                            f"⚠️ **ПРЕВЫШЕНИЕ ЛИМИТА!**\n"
-                            f"Ты потратил {total_spent:.2f} ₽ по категории «{category}» в этом месяце, "
-                            f"а лимит установлен в {limit_value:.2f} ₽. Лимит превышен на {excess:.2f} ₽!"
-                        )
-
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    amount_kop INTEGER,
+                    category TEXT,
+                    type TEXT,
+                    date TEXT
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS category_limits (
+                    user_id INTEGER,
+                    category TEXT,
+                    limit_amount REAL,
+                    reset_date TEXT,
+                    PRIMARY KEY (user_id, category)
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS recurring_payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    amount_kop INTEGER,
+                    category TEXT,
+                    type TEXT,
+                    freq TEXT,
+                    action TEXT,
+                    next_run TEXT
+                )
+            """)
+            await _migrate(db)
             await db.commit()
-            return True, warning
+    except aiosqlite.Error as e:
+        logger.exception("Не удалось инициализировать базу данных")
+        raise DatabaseError("Ошибка базы данных при инициализации") from e
 
-        except Exception as e:
-            print(f"Database error: {e}")
-            return False, None
+
+async def _migrate(db):
+    for table, old_col, new_col in (
+        ("transactions", "amount", "amount_kop"),
+        ("users", "balance", "balance_kop"),
+        ("recurring_payments", "amount", "amount_kop"),
+    ):
+        cur = await db.execute(f"PRAGMA table_info({table})")
+        cols = {r[1] for r in await cur.fetchall()}
+        if new_col not in cols:
+            default = " DEFAULT 0" if table == "users" else ""
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {new_col} INTEGER{default}")
+            if old_col in cols:
+                await db.execute(
+                    f"UPDATE {table} SET {new_col} = CAST(ROUND({old_col} * 100) AS INTEGER)"
+                )
+
+
+# транзакции
+async def add_transaction(user_id: int, amount: float, category: str, t_type: str) -> Optional[str]:
+    kop = int(round(float(amount) * 100))
+    category = (category or "").strip().lower()
+    delta = kop if t_type == "income" else -kop
+    now = datetime.now()
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute(
+                """INSERT INTO transactions (user_id, amount_kop, category, type, date)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (user_id, kop, category, t_type, now.strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            await db.execute(
+                """INSERT INTO users (user_id, balance_kop) VALUES (?, ?)
+                   ON CONFLICT(user_id) DO UPDATE SET balance_kop = balance_kop + ?""",
+                (user_id, delta, delta),
+            )
+            warning = await _check_category_limit(db, user_id, category, now)
+            await db.commit()
+    except aiosqlite.Error as e:
+        logger.exception("Ошибка БД при сохранении транзакции")
+        raise DatabaseError("Не удалось сохранить операцию. Попробуй позже.") from e
+    return warning
 
 
 async def get_balance(user_id: int) -> float:
     async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute(
-            "SELECT balance FROM users WHERE user_id = ?",
-            (user_id,)
+        cur = await db.execute(
+            "SELECT balance_kop FROM users WHERE user_id = ?", (user_id,)
         )
-        row = await cursor.fetchone()
-        return float(row[0]) if row else 0.0
+        row = await cur.fetchone()
+    return (row[0] if row and row[0] is not None else 0) / 100
+
+async def delete_category_limit(user_id: int, limit_id: int) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "DELETE FROM category_limits WHERE rowid = ? AND user_id = ?",
+            (limit_id, user_id),
+        )
+        await db.commit()
+    return cur.rowcount > 0
 
 
-async def get_last_transactions(user_id: int, limit: int = 10, trans_type: str = "expense"):
+async def get_last_transactions(user_id: int, limit: int = 10,
+                                trans_type: Optional[str] = None) -> List[Dict[str, Any]]:
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            """
-            SELECT category, amount, date AS created_at
-            FROM transactions
-            WHERE user_id = ? AND type = ?
-            ORDER BY date DESC
-            LIMIT ?
-            """,
-            (user_id, trans_type, limit)
-        )
-        rows = await cursor.fetchall()
-        return [
-            {
-                "category": row["category"],
-                "amount": row["amount"],
-                "date": row["created_at"]
-            }
-            for row in rows
-        ]
+        query = "SELECT category, amount_kop, date FROM transactions WHERE user_id = ?"
+        params: list = [user_id]
+        if trans_type:
+            query += " AND type = ?"
+            params.append(trans_type)
+        query += " ORDER BY date DESC LIMIT ?"
+        params.append(limit)
+        cur = await db.execute(query, params)
+        rows = await cur.fetchall()
+    return [
+        {
+            "category": r["category"],
+            "amount": (r["amount_kop"] or 0) / 100,
+            "date": _format_date(r["date"]),
+        }
+        for r in rows
+    ]
 
 
-async def get_all_transactions(user_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT category, amount, type, date AS created_at FROM transactions WHERE user_id = ?",
-            (user_id,)
-        )
-        rows = await cursor.fetchall()
-        return [
-            {
-                "category": row["category"],
-                "amount": row["amount"],
-                "type": row["type"],
-                "date": row["created_at"]
-            }
-            for row in rows
-        ]
+
+# лимиты
+async def _get_limit_row(db, user_id: int, category: str) -> Optional[Dict[str, Any]]:
+    cur = await db.execute(
+        """SELECT rowid AS id, category, limit_amount, reset_date
+           FROM category_limits WHERE user_id = ? AND category = ?""",
+        (user_id, category),
+    )
+    r = await cur.fetchone()
+    return dict(r) if r else None
 
 
-async def get_expenses_by_period(user_id: int, period: str = "month"):
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-
-        now = datetime.now()
-        if period == "day":
-            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        elif period == "week":
-            start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-        elif period == "month":
-            # Ровно с 1-го числа текущего месяца
-            start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        elif period == "year":
-            start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-        else:
-            raise ValueError("Неверный период")
-
-        cursor = await db.execute(
-            """
-            SELECT category, amount
-            FROM transactions
-            WHERE user_id = ? AND type = 'expense' AND date >= ?
-            ORDER BY date DESC
-            """,
-            (user_id, start.strftime("%Y-%m-%d %H:%M:%S"))
-        )
-        rows = await cursor.fetchall()
-        return [
-            {"category": row["category"], "amount": row["amount"]}
-            for row in rows
-        ]
+async def _check_category_limit(db, user_id: int, category: str, now: datetime) -> Optional[str]:
+    limit_row = await _get_limit_row(db, user_id, category)
+    if not limit_row or not limit_row["limit_amount"]:
+        return None
+    limit_amount = float(limit_row["limit_amount"])
+    period_start = _period_start(limit_row["reset_date"], now)
+    cur = await db.execute(
+        """SELECT COALESCE(SUM(amount_kop), 0) FROM transactions
+           WHERE user_id = ? AND type = 'expense' AND category = ?
+             AND substr(date, 1, 10) >= ?""",
+        (user_id, category, period_start.strftime("%Y-%m-%d")),
+    )
+    spent = (await cur.fetchone())[0] / 100
+    if spent > limit_amount:
+        return (f"⚠️ ПРЕВЫШЕН ЛИМИТ «{category.capitalize()}»: "
+                f"{spent:.2f} ₽ из {limit_amount:.2f} ₽")
+    if spent > limit_amount * 0.8:
+        return (f"🔔 Внимание: траты по «{category.capitalize()}» достигли "
+                f"{spent / limit_amount * 100:.0f}% лимита")
+    return None
 
 
-async def set_category_limit(user_id: int, category: str, limit: float):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS category_limits (
-                user_id INTEGER,
-                category TEXT,
-                limit_amount REAL,
-                reset_date TEXT,
-                PRIMARY KEY (user_id, category)
+async def get_category_spent_since(user_id: int, category: str) -> float:
+    now = datetime.now()
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            limit_row = await _get_limit_row(db, user_id, category.lower())
+            period_start = _period_start(limit_row["reset_date"] if limit_row else None, now)
+            cur = await db.execute(
+                """SELECT COALESCE(SUM(amount_kop), 0) FROM transactions
+                   WHERE user_id = ? AND type = 'expense' AND category = ?
+                     AND substr(date, 1, 10) >= ?""",
+                (user_id, category.lower(), period_start.strftime("%Y-%m-%d")),
             )
-        """)
-        today = datetime.now().strftime("%Y-%m-%d")
-        await db.execute(
-            "INSERT OR REPLACE INTO category_limits (user_id, category, limit_amount, reset_date) VALUES (?, ?, ?, ?)",
-            (user_id, category.lower(), limit, today)
-        )
-        await db.commit()
+            spent = (await cur.fetchone())[0]
+    except aiosqlite.Error as e:
+        logger.exception("Ошибка БД при подсчёте трат по категории")
+        raise DatabaseError("Не удалось посчитать траты по категории") from e
+    return spent / 100
 
 
-async def get_category_limits(user_id: int):
+async def set_category_limit(user_id: int, category: str, limit_amount: float):
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                """INSERT INTO category_limits (user_id, category, limit_amount)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(user_id, category)
+                   DO UPDATE SET limit_amount = excluded.limit_amount""",
+                (user_id, category.strip().lower(), float(limit_amount)),
+            )
+            await db.commit()
+    except aiosqlite.Error as e:
+        logger.exception("Ошибка БД при установке лимита")
+        raise DatabaseError("Не удалось сохранить лимит") from e
+
+
+async def get_category_limits(user_id: int) -> List[Dict[str, Any]]:
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT category, limit_amount FROM category_limits WHERE user_id = ?",
-            (user_id,)
+        cur = await db.execute(
+            """SELECT rowid AS id, category, limit_amount AS limit_, reset_date
+               FROM category_limits WHERE user_id = ? ORDER BY category""",
+            (user_id,),
         )
-        rows = await cursor.fetchall()
-        return [{"category": row["category"], "limit": row["limit_amount"]} for row in rows]
+        rows = await cur.fetchall()
+    return [
+        {
+            "id": r["id"],
+            "category": r["category"],
+            "limit": r["limit_"],
+            "reset_date": r["reset_date"],
+        }
+        for r in rows
+    ]
 
 
-async def reset_category_limit(user_id: int, category: str):
+async def get_limit_by_id(limit_id: int, user_id: int) -> Optional[Dict[str, Any]]:
     async with aiosqlite.connect(DB_NAME) as db:
-        today = datetime.now().strftime("%Y-%m-%d")
-        await db.execute(
-            """
-            INSERT OR REPLACE INTO category_limits (user_id, category, limit_amount, reset_date)
-            VALUES (?, ?, ?, ?)
-            """,
-            (user_id, category.lower(), 0.0, today)
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT rowid AS id, category, limit_amount AS limit_, reset_date
+               FROM category_limits WHERE rowid = ? AND user_id = ?""",
+            (limit_id, user_id),
         )
-        await db.commit()
-
-def compute_next_run(freq: str, from_date):
-    if freq == "daily":
-        return from_date + timedelta(days=1)
-    if freq == "weekly":
-        return from_date + timedelta(days=7)
-    return from_date + relativedelta(months=1)  # monthly
+        r = await cur.fetchone()
+    if not r:
+        return None
+    return {"id": r["id"], "category": r["category"], "limit": r["limit_"],
+            "reset_date": r["reset_date"]}
 
 
+async def reset_category_limit(user_id: int, limit_id: int):
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                "UPDATE category_limits SET reset_date = ? WHERE rowid = ? AND user_id = ?",
+                (datetime.now().strftime("%Y-%m-%d"), limit_id, user_id),
+            )
+            await db.commit()
+    except aiosqlite.Error as e:
+        logger.exception("Ошибка БД при сбросе лимита")
+        raise DatabaseError("Не удалось сбросить счётчик") from e
+
+
+# периоды
+_PERIOD_RANGES = {
+    "day": lambda now: now.replace(hour=0, minute=0, second=0, microsecond=0),
+    "week": lambda now: (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0),
+    "month": lambda now: now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+    "year": lambda now: now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0),
+}
+
+
+async def get_expenses_by_period(user_id: int, period: str = "month") -> List[Dict[str, Any]]:
+    if period not in _PERIOD_RANGES:
+        raise ValueError(f"Неизвестный период: {period}")
+    start = _PERIOD_RANGES[period](datetime.now()).strftime("%Y-%m-%d")
+    end = datetime.now().strftime("%Y-%m-%d")
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT category, SUM(amount_kop) AS total
+                   FROM transactions
+                   WHERE user_id = ? AND type = 'expense'
+                     AND substr(date, 1, 10) BETWEEN ? AND ?
+                   GROUP BY category ORDER BY total DESC""",
+                (user_id, start, end),
+            )
+            rows = await cur.fetchall()
+    except aiosqlite.Error as e:
+        logger.exception("Ошибка БД при выборке расходов за период")
+        raise DatabaseError("Не удалось получить расходы за период") from e
+    return [{"category": r["category"], "amount": (r["total"] or 0) / 100} for r in rows]
+
+
+async def get_period_stats(user_id: int, start_date, end_date) -> Dict[str, Any]:
+    start_str = _day(start_date)
+    end_str = _day(end_date)
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT
+                       COALESCE(SUM(CASE WHEN type = 'expense' THEN amount_kop ELSE 0 END), 0) AS total_expense,
+                       COALESCE(SUM(CASE WHEN type = 'income' THEN amount_kop ELSE 0 END), 0) AS total_income
+                   FROM transactions
+                   WHERE user_id = ? AND substr(date, 1, 10) BETWEEN ? AND ?""",
+                (user_id, start_str, end_str),
+            )
+            row = await cur.fetchone()
+            cur = await db.execute(
+                """SELECT category, SUM(amount_kop) AS total
+                   FROM transactions
+                   WHERE user_id = ? AND type = 'expense'
+                     AND substr(date, 1, 10) BETWEEN ? AND ?
+                   GROUP BY category ORDER BY total DESC""",
+                (user_id, start_str, end_str),
+            )
+            cat_rows = await cur.fetchall()
+    except aiosqlite.Error as e:
+        logger.exception("Ошибка БД при формировании отчёта")
+        raise DatabaseError("Не удалось сформировать отчёт") from e
+    return {
+        "total_expense": (row["total_expense"] or 0) / 100,
+        "total_income": (row["total_income"] or 0) / 100,
+        "categories": [
+            {"category": r["category"], "amount": (r["total"] or 0) / 100}
+            for r in cat_rows
+        ],
+    }
+
+
+# CSV
+async def export_transactions_to_csv_rows(user_id: int) -> List[List[str]]:
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            cur = await db.execute(
+                """SELECT date, category, type, amount_kop FROM transactions
+                   WHERE user_id = ? ORDER BY date DESC""",
+                (user_id,),
+            )
+            rows = await cur.fetchall()
+    except aiosqlite.Error as e:
+        logger.exception("Ошибка БД при экспорте CSV")
+        raise DatabaseError("Не удалось выгрузить историю операций") from e
+
+    csv_data = [["Дата", "Категория", "Тип операции", "Сумма (₽)"]]
+    for raw_date, category, t_type, kop in rows:
+        csv_data.append([
+            _format_date(raw_date),
+            (category or "").capitalize(),
+            "Пополнение" if t_type == "income" else "Трата",
+            f"{(kop or 0) / 100:,.2f}".replace(",", " ").replace(".", ",") + " ₽",
+        ])
+    return csv_data
+
+
+# регулярные платежи
 async def add_recurring_payment(user_id: int, amount: float, category: str,
                                 t_type: str, freq: str, action: str):
-    from datetime import date as date_cls
-    today = date_cls.today()
-    next_run = compute_next_run(freq, today).strftime("%Y-%m-%d")
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT INTO recurring_payments (user_id, amount, category, type, freq, action, next_run) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (user_id, amount, category.lower(), t_type, freq, action, next_run)
-        )
-        await db.commit()
+    kop = int(round(float(amount) * 100))
+    step = FREQ_STEPS.get(freq, FREQ_STEPS["monthly"])
+    now = datetime.now()
+    next_run = step(now).strftime("%Y-%m-%d")
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                """INSERT INTO recurring_payments
+                   (user_id, amount_kop, category, type, freq, action, next_run)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, kop, category.lower(), t_type, freq, action, next_run),
+            )
+            await db.commit()
+    except aiosqlite.Error as e:
+        logger.exception("Ошибка БД при добавлении регулярного платежа")
+        raise DatabaseError("Не удалось сохранить платёж") from e
 
 
-async def get_recurring_payments(user_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM recurring_payments WHERE user_id = ? ORDER BY next_run",
-            (user_id,)
-        )
-        return [dict(r) for r in await cursor.fetchall()]
-
-
-async def get_due_recurring_payments(today_str: str):
+async def get_recurring_payments(user_id: int) -> List[Dict[str, Any]]:
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM recurring_payments WHERE next_run <= ?",
-            (today_str,)
+        cur = await db.execute(
+            """SELECT id, user_id, amount_kop, category, type, freq, action, next_run
+               FROM recurring_payments WHERE user_id = ? ORDER BY next_run""",
+            (user_id,),
         )
-        return [dict(r) for r in await cursor.fetchall()]
+        rows = await cur.fetchall()
+    return [
+        {
+            "id": r["id"], "user_id": r["user_id"],
+            "amount": (r["amount_kop"] or 0) / 100, "amount_kop": r["amount_kop"],
+            "category": r["category"], "type": r["type"],
+            "freq": r["freq"], "action": r["action"], "next_run": r["next_run"],
+        }
+        for r in rows
+    ]
 
 
-async def advance_recurring_payment(payment_id: int, freq: str):
-    from datetime import date as date_cls
-    d = date_cls.today()
-    next_run = compute_next_run(freq, d)
-    while next_run.strftime("%Y-%m-%d") <= d.strftime("%Y-%m-%d"):
-        next_run = compute_next_run(freq, next_run)
+async def get_due_recurring_payments(today: str) -> List[Dict[str, Any]]:
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "UPDATE recurring_payments SET next_run = ? WHERE id = ?",
-            (next_run.strftime("%Y-%m-%d"), payment_id)
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT id, user_id, amount_kop, category, type, freq, action, next_run
+               FROM recurring_payments WHERE substr(next_run, 1, 10) <= ?
+               ORDER BY next_run""",
+            (today,),
         )
-        await db.commit()
+        rows = await cur.fetchall()
+    return [
+        {
+            "id": r["id"], "user_id": r["user_id"],
+            "amount": (r["amount_kop"] or 0) / 100, "amount_kop": r["amount_kop"],
+            "category": r["category"], "type": r["type"],
+            "freq": r["freq"], "action": r["action"], "next_run": r["next_run"],
+        }
+        for r in rows
+    ]
+
+
+async def process_recurring_payment(payment: Dict[str, Any]) -> Optional[str]:
+    now = datetime.now()
+    freq = payment["freq"]
+    step = FREQ_STEPS.get(freq)
+    if step is None:
+        logger.error("Неизвестная периодичность '%s' у платежа id=%s", freq, payment["id"])
+        step = FREQ_STEPS["monthly"]
+        freq = "monthly"
+    planned = datetime.strptime(payment["next_run"][:10], "%Y-%m-%d")
+    guard = 0
+    while planned <= now and guard < 400:
+        planned = step(planned)
+        guard += 1
+
+    kop = int(payment["amount_kop"] or 0)
+    delta = kop if payment["type"] == "income" else -kop
+    action = payment.get("action", "auto")
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            warning: Optional[str] = None
+            if action == "auto":
+                await db.execute(
+                    """INSERT INTO transactions (user_id, amount_kop, category, type, date)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (payment["user_id"], kop, payment["category"], payment["type"],
+                     now.strftime("%Y-%m-%d %H:%M:%S")),
+                )
+                await db.execute(
+                    """INSERT INTO users (user_id, balance_kop) VALUES (?, ?)
+                       ON CONFLICT(user_id) DO UPDATE SET balance_kop = balance_kop + ?""",
+                    (payment["user_id"], delta, delta),
+                )
+                warning = await _check_category_limit(db, payment["user_id"],
+                                                      payment["category"], now)
+            await db.execute(
+                "UPDATE recurring_payments SET next_run = ?, freq = ? WHERE id = ?",
+                (planned.strftime("%Y-%m-%d"), freq, payment["id"]),
+            )
+            await db.commit()
+    except aiosqlite.Error as e:
+        logger.exception("Ошибка БД при обработке регулярного платежа id=%s", payment["id"])
+        raise DatabaseError("Не удалось обработать регулярный платёж") from e
+    return warning
+
 
 
 async def delete_recurring_payment(payment_id: int, user_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "DELETE FROM recurring_payments WHERE id = ? AND user_id = ?",
-            (payment_id, user_id)
-        )
-        await db.commit()
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                "DELETE FROM recurring_payments WHERE id = ? AND user_id = ?",
+                (payment_id, user_id),
+            )
+            await db.commit()
+    except aiosqlite.Error as e:
+        logger.exception("Ошибка БД при удалении регулярного платежа")
+        raise DatabaseError("Не удалось удалить платёж") from e

@@ -1,9 +1,0 @@
-# Default ignored files
-.env
-finance.db
-__pycache__/
-*.pyc
-.venv/
-venv/
-.idea/
-.vscode/
